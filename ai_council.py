@@ -1,12 +1,12 @@
 import requests
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
 
 # =======================
 # Basic config
 # =======================
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "llama3.1:8b"
+MODEL_NAME = "llama3.1:8b"   # You already pulled this
 
 
 @dataclass
@@ -16,6 +16,38 @@ class Agent:
     system_prompt: str
     wins: int = 0
     total_answers: int = 0
+
+
+class ConversationMemory:
+    """
+    Simple short-term memory for the council.
+    Stores the last N (user, assistant) turns and turns them into
+    chat-style messages to send back to the model each time.
+    """
+    def __init__(self, max_turns: int = 10):
+        self.max_turns = max_turns
+        self.turns: List[Tuple[str, str]] = []  # list of (user_text, assistant_text)
+
+    def add_turn(self, user_text: str, assistant_text: str):
+        self.turns.append((user_text, assistant_text))
+        # keep only the most recent max_turns
+        if len(self.turns) > self.max_turns:
+            self.turns = self.turns[-self.max_turns:]
+
+    def to_messages(self) -> List[Dict[str, str]]:
+        """
+        Convert stored turns into a chat message list:
+        user, assistant, user, assistant, ...
+        """
+        messages: List[Dict[str, str]] = []
+        for user_text, assistant_text in self.turns:
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": assistant_text})
+        return messages
+
+
+# Global council memory
+MEMORY = ConversationMemory(max_turns=10)
 
 
 # Define your council members here
@@ -50,18 +82,31 @@ COUNCIL: List[Agent] = [
 # =======================
 # LLM helpers
 # =======================
-def call_ollama(system_prompt: str, user_prompt: str) -> str:
+def call_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    history_messages: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """
-    Single call to Ollama's /api/chat endpoint with a system + user message.
-    Requires Ollama running locally and MODEL_NAME pulled.
+    Single call to Ollama's /api/chat endpoint with:
+      - a system prompt
+      - optional chat history
+      - current user prompt
+
+    'history_messages' should be a list of {"role": ..., "content": ...}
+    typically coming from ConversationMemory.to_messages().
     """
+    if history_messages is None:
+        history_messages = []
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": user_prompt})
+
     payload = {
         "model": MODEL_NAME,
         "stream": False,  # easier to handle than streaming
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": messages,
     }
 
     resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
@@ -70,35 +115,38 @@ def call_ollama(system_prompt: str, user_prompt: str) -> str:
     return data["message"]["content"].strip()
 
 
-def ask_agent(agent: Agent, question: str) -> str:
+def ask_agent(agent: Agent, question: str, memory: ConversationMemory) -> str:
     """
     Ask a single agent the question using its system prompt.
+    The agent sees the recent conversation history from MEMORY.
     """
     agent_prompt = (
-        f"You are {agent.name}, a {agent.role} in a council of AIs. "
-        f"Answer the user's question clearly and concisely.\n\n"
-        f"User question: {question}"
+        f"You are {agent.name}, a {agent.role} in a council of AIs.\n"
+        f"You see the recent conversation above as context. "
+        f"Answer the user's new question clearly and concisely.\n\n"
+        f"User's current question: {question}"
     )
-    answer = call_ollama(agent.system_prompt, agent_prompt)
+    history = memory.to_messages()
+    answer = call_ollama(agent.system_prompt, agent_prompt, history_messages=history)
     agent.total_answers += 1
     return answer
 
 
-def run_council(question: str) -> Tuple[Dict[str, str], str, str]:
+def run_council(question: str, memory: ConversationMemory):
     """
-    Ask all council members the question, collect their answers, then run a judge pass
-    to pick the best answer.
+    Ask all council members the question (with memory), collect their answers,
+    then run a judge pass to pick the best answer.
 
     Returns:
         answers_by_agent: dict[agent_name] -> answer text
         winning_agent_name: name of the chosen agent
         winning_answer: the answer text
     """
-    # 1 – Each agent answers
+    # 1 – Each agent answers, conditioned on conversation memory
     answers_by_agent: Dict[str, str] = {}
     for agent in COUNCIL:
         print(f"\n=== {agent.name} is thinking... ===")
-        ans = ask_agent(agent, question)
+        ans = ask_agent(agent, question, memory)
         answers_by_agent[agent.name] = ans
         print(f"{agent.name} answered.\n")
 
@@ -114,7 +162,8 @@ def run_council(question: str) -> Tuple[Dict[str, str], str, str]:
         "- Do not explain your reasoning, do not add extra words."
     )
 
-    judge_output = call_ollama(judge_system, judge_prompt)
+    # Judge does NOT use memory here to keep selection clean
+    judge_output = call_ollama(judge_system, judge_prompt, history_messages=None)
     winning_agent_name = parse_winning_agent(judge_output, answers_by_agent.keys())
     if winning_agent_name is None:
         # fallback: pick first agent if judge fails
@@ -145,13 +194,12 @@ def build_judge_prompt(question: str, answers_by_agent: Dict[str, str]) -> str:
     return text
 
 
-def parse_winning_agent(judge_output: str, agent_names) -> str | None:
+def parse_winning_agent(judge_output: str, agent_names) -> Optional[str]:
     """
     Try to extract which agent the judge chose, based on the raw model output.
     We tolerate extra spaces and punctuation.
     """
     raw = judge_output.strip().lower()
-    # Sometimes the model might respond like "The best answer is: Analyst"
     for name in agent_names:
         if name.lower() in raw:
             return name
@@ -163,7 +211,7 @@ def parse_winning_agent(judge_output: str, agent_names) -> str | None:
 # =======================
 def maybe_eliminate_and_replace(threshold_answers: int = 10, min_win_rate: float = 0.1):
     """
-    Optional: After enough questions, you can 'cull' underperforming agents
+    Optional: After enough questions, you can 'cull' underperforming agents.
 
     Any agent with total_answers >= threshold_answers and
     win rate < min_win_rate will be replaced with a fresh 'Trainee' agent.
@@ -204,7 +252,7 @@ def maybe_eliminate_and_replace(threshold_answers: int = 10, min_win_rate: float
 # Interactive loop
 # =======================
 def main():
-    print("=== Mini AI Council (Ollama) ===")
+    print("=== Mini AI Council (Ollama, with memory) ===")
     print(f"Using model: {MODEL_NAME}")
     print("Type a question and press Enter. Type 'quit' to exit.\n")
 
@@ -225,7 +273,7 @@ def main():
 
         questions_asked += 1
 
-        answers_by_agent, winner_name, winner_answer = run_council(question)
+        answers_by_agent, winner_name, winner_answer = run_council(question, MEMORY)
 
         print("\n================= Council Answers =================")
         for name, ans in answers_by_agent.items():
@@ -235,6 +283,9 @@ def main():
         print("\n================== Council Verdict =================")
         print(f"Winning agent: {winner_name}")
         print(f"\nAnswer:\n{winner_answer}")
+
+        # Update memory with this turn (user question + winning answer)
+        MEMORY.add_turn(question, winner_answer)
 
         # Optional elimination mechanic every N questions
         if questions_asked % 5 == 0:
