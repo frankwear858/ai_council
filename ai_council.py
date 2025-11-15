@@ -6,7 +6,7 @@ from typing import List, Dict, Tuple, Optional
 # Basic config
 # =======================
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "llama3.1:8b"   # You already pulled this
+MODEL_NAME = "llama3.1:8b"
 
 
 @dataclass
@@ -301,3 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
