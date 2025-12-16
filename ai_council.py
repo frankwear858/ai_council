@@ -5,12 +5,14 @@ from typing import List, Dict, Tuple, Optional
 # =======================
 # Basic config
 # =======================
+# Ollama local chat endpoint + model tag pulled locally.
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "llama3.1:8b"
 
 
 @dataclass
 class Agent:
+    """Represents one council member and its simple performance stats."""
     name: str
     role: str
     system_prompt: str
@@ -21,24 +23,23 @@ class Agent:
 class ConversationMemory:
     """
     Simple short-term memory for the council.
-    Stores the last N (user, assistant) turns and turns them into
-    chat-style messages to send back to the model each time.
+
+    Stores the last N (user, assistant) turns and can convert them into
+    Ollama chat-style messages so each agent gets recent context.
     """
     def __init__(self, max_turns: int = 10):
         self.max_turns = max_turns
-        self.turns: List[Tuple[str, str]] = []  # list of (user_text, assistant_text)
+        self.turns: List[Tuple[str, str]] = []  # (user_text, assistant_text)
 
     def add_turn(self, user_text: str, assistant_text: str):
+        """Append a turn and keep only the most recent max_turns."""
         self.turns.append((user_text, assistant_text))
         # keep only the most recent max_turns
         if len(self.turns) > self.max_turns:
             self.turns = self.turns[-self.max_turns:]
 
     def to_messages(self) -> List[Dict[str, str]]:
-        """
-        Convert stored turns into a chat message list:
-        user, assistant, user, assistant, ...
-        """
+        """Convert stored turns into chat messages: user, assistant, user, assistant, ..."""
         messages: List[Dict[str, str]] = []
         for user_text, assistant_text in self.turns:
             messages.append({"role": "user", "content": user_text})
@@ -46,7 +47,7 @@ class ConversationMemory:
         return messages
 
 
-# Global council memory
+# Global council memory (shared across the session)
 MEMORY = ConversationMemory(max_turns=10)
 
 
@@ -56,24 +57,21 @@ COUNCIL: List[Agent] = [
         name="Analyst",
         role="careful analyst",
         system_prompt=(
-            "You are a calm, highly analytical assistant. "
-            "You think step-by-step, avoid speculation, and clearly explain your reasoning."
+            "You are a calm, highly analytical assistant. You think step-by-step, avoid speculation, and clearly explain your reasoning."
         ),
     ),
     Agent(
         name="Optimist",
         role="optimistic strategist",
         system_prompt=(
-            "You are optimistic but realistic. You look for upside and opportunities, "
-            "while still mentioning key risks briefly."
+            "You are optimistic but realistic. You look for upside and opportunities, while still mentioning key risks briefly."
         ),
     ),
     Agent(
         name="Skeptic",
         role="critical reviewer",
         system_prompt=(
-            "You are a skeptical critic. You point out flaws, risks, and hidden assumptions, "
-            "and you focus on what could go wrong."
+            "You are a skeptical critic. You point out flaws, risks, and hidden assumptions, and you focus on what could go wrong."
         ),
     ),
 ]
@@ -88,30 +86,35 @@ def call_ollama(
     history_messages: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
-    Single call to Ollama's /api/chat endpoint with:
-      - a system prompt
-      - optional chat history
-      - current user prompt
+    Call Ollama's /api/chat endpoint.
 
-    'history_messages' should be a list of {"role": ..., "content": ...}
-    typically coming from ConversationMemory.to_messages().
+    Args:
+        system_prompt: The system instruction for the model ("who you are").
+        user_prompt: The current request (your constructed prompt).
+        history_messages: Optional prior messages as [{"role": "...", "content": "..."}].
+
+    Returns:
+        The assistant's text response (trimmed).
     """
     if history_messages is None:
         history_messages = []
 
+    # Build the chat payload: system -> history -> current user prompt
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_messages)
     messages.append({"role": "user", "content": user_prompt})
 
     payload = {
         "model": MODEL_NAME,
-        "stream": False,  # easier to handle than streaming
+        "stream": False,  # keep it simple (no streaming parsing)
         "messages": messages,
     }
 
     resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
+
+    # Ollama /api/chat returns: {"message": {"role": "...", "content": "..."}, ...}
     return data["message"]["content"].strip()
 
 
@@ -277,7 +280,7 @@ def main():
 
         print("\n================= Council Answers =================")
         for name, ans in answers_by_agent.items():
-            print(f"\n--- {name} ---")
+            print(f"\n===== {name.upper()} =====")
             print(ans)
 
         print("\n================== Council Verdict =================")
@@ -301,4 +304,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
